@@ -20,7 +20,6 @@ from comfy_api.latest import ComfyExtension, io, ui
 from comfy_extras.nodes_sam3 import _extract_text_prompts, _refine_mask
 from ._runtime import resolve_ffmpeg_bin
 from ._identity import (
-    filter_objects_by_seed_color,
     masked_color_distance,
     masked_color_signature_distance,
     masked_feature_cosine_similarity,
@@ -2694,31 +2693,56 @@ def _seed_identity_object_indices(
     seed_count: int,
     max_distance: float,
 ) -> str:
-    """按种子颜色签名过滤 spawn 对象，返回 TrackToMask 的 object_indices。"""
+    """按种子颜色签名过滤 spawn 对象，返回 TrackToMask 的 object_indices。
+
+    逐对象流式解包（每对象只取首个非空帧），内存 O(1)——全量 stack 会在
+    长视频 × 多对象场景把整机内存打爆（1100 帧 × 40 对象 ≈ 14GB，实测触发内核 OOM）。
+    """
 
     from comfy.ldm.sam3.tracker import unpack_masks
 
     packed = track_data["packed_masks"]
+    frame_count = int(packed.shape[0])
     object_count = int(packed.shape[1])
     if object_count <= seed_count:
         return ""
-    object_masks = torch.stack(
-        [unpack_masks(packed[:, index]).float() for index in range(object_count)],
-        dim=1,
-    ).cpu()
-    mask_height, mask_width = object_masks.shape[-2], object_masks.shape[-1]
-    frames_small = F.interpolate(
-        frames.movedim(-1, 1).float().cpu(),
-        size=(mask_height, mask_width),
-        mode="bilinear",
-        align_corners=False,
-    ).movedim(1, -1)
-    kept = filter_objects_by_seed_color(
-        frames_small.numpy(),
-        object_masks.numpy(),
-        seed_count=seed_count,
-        max_distance=max_distance,
-    )
+
+    def first_visible(object_index: int) -> tuple[int, torch.Tensor] | None:
+        for frame_index in range(frame_count):
+            mask = unpack_masks(packed[frame_index:frame_index + 1, object_index])[0].float()
+            if float(mask.sum().item()) > 0:
+                return frame_index, mask.cpu()
+        return None
+
+    def frame_small(frame_index: int, height: int, width: int) -> torch.Tensor:
+        return F.interpolate(
+            frames[frame_index:frame_index + 1].movedim(-1, 1).float().cpu(),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        ).movedim(1, -1)[0]
+
+    reference = first_visible(0)
+    if reference is None:
+        return ""
+    reference_frame, reference_mask = reference
+    mask_height, mask_width = reference_mask.shape[-2], reference_mask.shape[-1]
+    reference_image = frame_small(reference_frame, mask_height, mask_width)
+
+    kept = list(range(seed_count))
+    for object_index in range(seed_count, object_count):
+        visible = first_visible(object_index)
+        if visible is None:
+            continue
+        frame_index, object_mask = visible
+        distance = masked_color_signature_distance(
+            reference_image.numpy(),
+            reference_mask.numpy(),
+            frame_small(frame_index, mask_height, mask_width).numpy(),
+            object_mask.numpy(),
+        )
+        if distance is None or distance <= max_distance:
+            kept.append(object_index)
     if len(kept) == object_count:
         return ""
     dropped = object_count - len(kept)
