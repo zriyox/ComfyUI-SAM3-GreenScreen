@@ -20,6 +20,7 @@ from comfy_api.latest import ComfyExtension, io, ui
 from comfy_extras.nodes_sam3 import _extract_text_prompts, _refine_mask
 from ._runtime import resolve_ffmpeg_bin
 from ._identity import (
+    filter_objects_by_seed_color,
     masked_color_distance,
     masked_color_signature_distance,
     masked_feature_cosine_similarity,
@@ -2686,6 +2687,45 @@ class SAM3GreenScreenVideo(io.ComfyNode):
         ]))
 
 
+def _seed_identity_object_indices(
+    frames: torch.Tensor,
+    track_data: dict,
+    *,
+    seed_count: int,
+    max_distance: float,
+) -> str:
+    """按种子颜色签名过滤 spawn 对象，返回 TrackToMask 的 object_indices。"""
+
+    from comfy.ldm.sam3.tracker import unpack_masks
+
+    packed = track_data["packed_masks"]
+    object_count = int(packed.shape[1])
+    if object_count <= seed_count:
+        return ""
+    object_masks = torch.stack(
+        [unpack_masks(packed[:, index]).float() for index in range(object_count)],
+        dim=1,
+    ).cpu()
+    mask_height, mask_width = object_masks.shape[-2], object_masks.shape[-1]
+    frames_small = F.interpolate(
+        frames.movedim(-1, 1).float().cpu(),
+        size=(mask_height, mask_width),
+        mode="bilinear",
+        align_corners=False,
+    ).movedim(1, -1)
+    kept = filter_objects_by_seed_color(
+        frames_small.numpy(),
+        object_masks.numpy(),
+        seed_count=seed_count,
+        max_distance=max_distance,
+    )
+    if len(kept) == object_count:
+        return ""
+    dropped = object_count - len(kept)
+    print(f"[SAM3_TrackVideoMasks] 身份过滤剔除 {dropped}/{object_count - seed_count} 个相似对象")
+    return ",".join(str(index) for index in kept)
+
+
 def _resize_mask_batch(masks: torch.Tensor, height: int, width: int) -> torch.Tensor:
     masks = masks.to(dtype=torch.float32, device="cpu")
     if masks.shape[-2] == height and masks.shape[-1] == width:
@@ -2736,6 +2776,14 @@ class SAM3TrackVideoMasks(io.ComfyNode):
                     step=0.01,
                     tooltip="有 anchor 种子的分段用此阈值抑制文本新增实例；0=沿用 detection_threshold",
                 ),
+                io.Float.Input(
+                    "seed_identity_max_distance",
+                    default=0.0,
+                    min=0.0,
+                    max=2.0,
+                    step=0.01,
+                    tooltip="单主体身份过滤：spawn 对象与种子的颜色签名距离超过此值即剔除；0=关闭",
+                ),
                 io.Int.Input("max_objects", default=0, min=0, max=64),
                 io.Int.Input("detect_interval", default=1, min=1),
                 io.Boolean.Input("override_anchor_frames", default=True),
@@ -2753,6 +2801,7 @@ class SAM3TrackVideoMasks(io.ComfyNode):
         anchor_frames_json="[]",
         detection_threshold=0.35,
         seeded_spawn_threshold=0.0,
+        seed_identity_max_distance=0.0,
         max_objects=0,
         detect_interval=1,
         override_anchor_frames=True,
@@ -2802,9 +2851,21 @@ class SAM3TrackVideoMasks(io.ComfyNode):
                 max_objects=max_objects,
                 detect_interval=detect_interval,
             ).args[0]
+            object_indices = ""
+            if (
+                seed is not None
+                and seed_identity_max_distance > 0.0
+                and track_data.get("packed_masks") is not None
+            ):
+                object_indices = _seed_identity_object_indices(
+                    frames,
+                    track_data,
+                    seed_count=int(seed.shape[0]),
+                    max_distance=float(seed_identity_max_distance),
+                )
             segment_masks = SAM3_TrackToMask.execute(
                 track_data=track_data,
-                object_indices="",
+                object_indices=object_indices,
             ).args[0].to(dtype=torch.float32, device="cpu")
             if segment.reverse:
                 segment_masks = torch.flip(segment_masks, dims=[0])

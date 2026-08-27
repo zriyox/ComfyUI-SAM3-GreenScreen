@@ -192,3 +192,53 @@ def select_identity_candidate(
             float(candidate.get("score", -1.0)),
         ),
     )
+
+
+def first_nonempty_frame(object_masks: Any, object_index: int) -> int | None:
+    """返回该对象第一帧非空 mask 的帧号（[N, N_obj, H, W]）。"""
+
+    frame_count = int(object_masks.shape[0])
+    for frame_index in range(frame_count):
+        mask = object_masks[frame_index, object_index]
+        total = float(mask.sum().item()) if hasattr(mask.sum(), "item") else float(mask.sum())
+        if total > 0:
+            return frame_index
+    return None
+
+
+def filter_objects_by_seed_color(
+    frames: Any,
+    object_masks: Any,
+    seed_count: int,
+    max_distance: float,
+) -> list[int]:
+    """保留种子对象与外观相近的 spawn 对象（单人/单主体身份语义）。
+
+    frames: [N, H, W, 3]；object_masks: [N, N_obj, H, W]，分辨率需一致。
+    比对基于亮度归一的平均颜色方向；无法评估（空 mask）时保守保留。
+    """
+
+    object_count = int(object_masks.shape[1])
+    if seed_count <= 0 or seed_count >= object_count or max_distance <= 0:
+        return list(range(object_count))
+
+    reference_frame = first_nonempty_frame(object_masks, 0)
+    if reference_frame is None:
+        return list(range(object_count))
+    reference_image = frames[reference_frame]
+    reference_mask = object_masks[reference_frame, 0]
+
+    kept = list(range(seed_count))
+    for object_index in range(seed_count, object_count):
+        frame_index = first_nonempty_frame(object_masks, object_index)
+        if frame_index is None:
+            continue
+        distance = masked_color_signature_distance(
+            reference_image,
+            reference_mask,
+            frames[frame_index],
+            object_masks[frame_index, object_index],
+        )
+        if distance is None or distance <= max_distance:
+            kept.append(object_index)
+    return kept

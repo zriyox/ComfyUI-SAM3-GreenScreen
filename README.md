@@ -30,8 +30,9 @@ Full-video mask tracking that wraps ComfyUI core's `SAM3_VideoTrack` / `SAM3_Tra
 - **Per-frame concept re-detection** — pass text `conditioning` so the detector re-acquires the subject after hard cuts (new instances auto-spawn).
 - **`seeded_spawn_threshold`** — when a seed guarantees recall of the confirmed instance, raise the spawn threshold for text-detected extra instances (default suggestion `0.6`) to suppress look-alike false positives (e.g. a same-category product in a different color) without hurting multi-instance products.
 - **`override_anchor_frames`** — anchor frames output exactly the confirmed masks.
+- **`seed_identity_max_distance`** — lightweight identity (ReID) filter: text-spawned objects whose brightness-normalized mean-color signature differs from the seed beyond this distance are excluded from the union. Use for single-identity subjects (a specific person among bystanders, one product in a comparison video). `0.12` is a field-tuned sweet spot; `0` disables. Too-tight values (≤0.08) can drop the target itself after hard cuts. Each anchor segment uses its own seed as reference, so outfit changes are handled by adding an anchor per outfit.
 
-Inputs: `images`, `model` (from `CheckpointLoaderSimple` on the SAM 3.1 checkpoint), optional `conditioning` / `anchor_masks`, `anchor_frames_json`, `detection_threshold` (0.35 works well for small products), `seeded_spawn_threshold`, `max_objects` (0 = internal cap 64 — small caps get exhausted by stale cross-cut tracks), `detect_interval`.
+Inputs: `images`, `model` (from `CheckpointLoaderSimple` on the SAM 3.1 checkpoint), optional `conditioning` / `anchor_masks`, `anchor_frames_json`, `detection_threshold` (0.35 works well for small products), `seeded_spawn_threshold`, `seed_identity_max_distance`, `max_objects` (0 = internal cap 64 — small caps get exhausted by stale cross-cut tracks), `detect_interval`.
 
 Output: `MASK` batch `[N,H,W]` (union of tracked objects per frame).
 
